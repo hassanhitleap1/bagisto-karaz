@@ -57,6 +57,7 @@ class ShopifyScraperCommand extends Command
     protected string $defaultLocale = 'en';
     protected string $defaultChannel = 'default';
     protected int $defaultInventorySourceId = 1;
+    protected array $availableLocales = [];
 
     /**
      * Constructor
@@ -98,6 +99,9 @@ class ShopifyScraperCommand extends Command
             $this->error('Please provide a Shopify store URL');
             return 1;
         }
+
+        // Load available locales from database
+        $this->loadAvailableLocales();
 
         $this->info("Starting Shopify import from: {$this->baseUrl}");
         $this->info("Configuration: {$this->perPage} products per page, starting at page {$this->currentPage}");
@@ -194,6 +198,22 @@ class ShopifyScraperCommand extends Command
         $this->info("Attributes created/updated: " . count($this->attributeCache));
 
         return 0;
+    }
+
+    /**
+     * Load available locales from database
+     */
+    protected function loadAvailableLocales(): void
+    {
+        $locales = DB::table('locales')->pluck('code')->toArray();
+
+        if (empty($locales)) {
+            $this->warn("No locales found in database. Using default locale 'en' only.");
+            $this->availableLocales = ['en'];
+        } else {
+            $this->availableLocales = $locales;
+            $this->info("Loaded locales: " . implode(', ', $locales));
+        }
     }
 
     protected function fetchProductsPage(int $page)
@@ -331,19 +351,19 @@ class ShopifyScraperCommand extends Command
                 'admin_name' => $vendorName,
                 'sort_order' => 0,
                 'attribute_id' => $brandAttribute->id,
-                'created_at' => now(),
-                'updated_at' => now(),
             ]);
 
-            // Create translation
-            DB::table('attribute_option_translations')->insert([
-                'locale' => $this->defaultLocale,
-                'label' => $vendorName,
-                'attribute_option_id' => $brandOptionId,
-            ]);
+            // Create translations for all available locales
+            foreach ($this->availableLocales as $locale) {
+                DB::table('attribute_option_translations')->insert([
+                    'locale' => $locale,
+                    'label' => $vendorName, // Same name for all locales (can be customized later)
+                    'attribute_option_id' => $brandOptionId,
+                ]);
+            }
 
             $brand = DB::table('attribute_options')->find($brandOptionId);
-            $this->info("  - Created brand option: {$vendorName}");
+            $this->info("  - Created brand option: {$vendorName} (locales: " . implode(', ', $this->availableLocales) . ")");
 
             // Download and assign brand image if available (swatch image)
             if ($imageData && !empty($imageData['src']) && !isset($this->brandImageCache[$vendorName])) {
@@ -371,25 +391,31 @@ class ShopifyScraperCommand extends Command
         if ($categoryTranslation) {
             $category = $this->categoryRepository->find($categoryTranslation->category_id);
         } else {
-            // Create new category using repository
+            // Create new category using repository with multi-locale support
             $slug = Str::slug($categoryName);
 
-            $category = $this->categoryRepository->create([
+            // Build category data with all locales
+            $categoryData = [
                 'position' => 1,
                 'status' => 1,
                 'display_mode' => 'products_and_description',
-                $this->defaultLocale => [
+            ];
+
+            // Add translations for all available locales
+            foreach ($this->availableLocales as $locale) {
+                $categoryData[$locale] = [
                     'name' => $categoryName,
                     'slug' => $slug,
                     'description' => "Category for {$categoryName} products",
                     'meta_title' => $categoryName,
                     'meta_description' => "Shop {$categoryName} products",
                     'meta_keywords' => $categoryName,
-                    'locale_id' => 1,
-                ],
-            ]);
+                ];
+            }
 
-            $this->info("  - Created category: {$categoryName}");
+            $category = $this->categoryRepository->create($categoryData);
+
+            $this->info("  - Created category: {$categoryName} (locales: " . implode(', ', $this->availableLocales) . ")");
 
             // Download and assign category image if available
             if ($imageData && !empty($imageData['src']) && !isset($this->categoryImageCache[$categoryName])) {
@@ -423,7 +449,6 @@ class ShopifyScraperCommand extends Command
             // Update attribute option with swatch image path
             DB::table('attribute_options')->where('id', $brandOptionId)->update([
                 'swatch_value' => $path,
-                'updated_at' => now(),
             ]);
 
             $this->info("    - Downloaded and assigned brand swatch image");
@@ -577,12 +602,14 @@ class ShopifyScraperCommand extends Command
                 'updated_at' => now(),
             ]);
 
-            // Create attribute translation
-            DB::table('attribute_translations')->insert([
-                'locale' => 'en',
-                'name' => $name,
-                'attribute_id' => $attributeId,
-            ]);
+            // Create attribute translations for all locales
+            foreach ($this->availableLocales as $locale) {
+                DB::table('attribute_translations')->insert([
+                    'locale' => $locale,
+                    'name' => $name,
+                    'attribute_id' => $attributeId,
+                ]);
+            }
 
             // Create attribute options
             foreach ($values as $index => $value) {
@@ -590,15 +617,16 @@ class ShopifyScraperCommand extends Command
                     'admin_name' => $value,
                     'sort_order' => $index,
                     'attribute_id' => $attributeId,
-                    'created_at' => now(),
-                    'updated_at' => now(),
                 ]);
 
-                DB::table('attribute_option_translations')->insert([
-                    'locale' => 'en',
-                    'label' => $value,
-                    'attribute_option_id' => $optionId,
-                ]);
+                // Create option translations for all locales
+                foreach ($this->availableLocales as $locale) {
+                    DB::table('attribute_option_translations')->insert([
+                        'locale' => $locale,
+                        'label' => $value,
+                        'attribute_option_id' => $optionId,
+                    ]);
+                }
             }
 
             $attribute = DB::table('attributes')->find($attributeId);
@@ -614,20 +642,11 @@ class ShopifyScraperCommand extends Command
         $firstVariant = $productData['variants'][0] ?? [];
         $sku = $this->generateSku($firstVariant, $productData['title']);
 
-        // Prepare product data for repository
+        // Prepare product data for repository with multi-locale support
         $data = [
             'type' => $productType,
             'attribute_family_id' => $attributeFamily->id,
             'sku' => $sku,
-            $this->defaultLocale => [
-                'name' => $productData['title'],
-                'url_key' => Str::slug($productData['title']) . '-' . Str::random(4),
-                'short_description' => $this->stripHtml($productData['body_html'] ?? ''),
-                'description' => $productData['body_html'] ?? '',
-                'meta_title' => $productData['title'],
-                'meta_keywords' => $productData['tags'] ?? '',
-                'meta_description' => substr($this->stripHtml($productData['body_html'] ?? ''), 0, 160),
-            ],
             'status' => 1,
             'visible_individually' => 1,
             'guest_checkout' => 1,
@@ -647,6 +666,20 @@ class ShopifyScraperCommand extends Command
                 $this->defaultInventorySourceId => (int) ($firstVariant['inventory_quantity'] ?? 0),
             ],
         ];
+
+        // Add translations for all available locales
+        $urlKey = Str::slug($productData['title']) . '-' . Str::random(4);
+        foreach ($this->availableLocales as $locale) {
+            $data[$locale] = [
+                'name' => $productData['title'],
+                'url_key' => $urlKey,
+                'short_description' => $this->stripHtml($productData['body_html'] ?? ''),
+                'description' => $productData['body_html'] ?? '',
+                'meta_title' => $productData['title'],
+                'meta_keywords' => $productData['tags'] ?? '',
+                'meta_description' => substr($this->stripHtml($productData['body_html'] ?? ''), 0, 160),
+            ];
+        }
 
         // Add super attributes for configurable products
         if ($productType === 'configurable' && !empty($superAttributes)) {
