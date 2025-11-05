@@ -57,7 +57,7 @@ class ShopifyScraperCommand extends Command
     protected string $defaultLocale = 'en';
     protected string $defaultChannel = 'default';
     protected int $defaultInventorySourceId = 1;
-    protected array $availableLocales = [];
+    protected array $availableLocales = ['en']; // Default to 'en' to prevent foreach errors
 
     /**
      * Constructor
@@ -205,14 +205,20 @@ class ShopifyScraperCommand extends Command
      */
     protected function loadAvailableLocales(): void
     {
-        $locales = DB::table('locales')->pluck('code')->toArray();
+        try {
+            $locales = DB::table('locales')->pluck('code')->toArray();
 
-        if (empty($locales)) {
-            $this->warn("No locales found in database. Using default locale 'en' only.");
+            // Ensure we have an array
+            if (!is_array($locales) || empty($locales)) {
+                $this->warn("No locales found in database. Using default locale 'en' only.");
+                $this->availableLocales = ['en'];
+            } else {
+                $this->availableLocales = $locales;
+                $this->info("Loaded locales: " . implode(', ', $locales));
+            }
+        } catch (\Exception $e) {
+            $this->warn("Failed to load locales: {$e->getMessage()}. Using default locale 'en' only.");
             $this->availableLocales = ['en'];
-        } else {
-            $this->availableLocales = $locales;
-            $this->info("Loaded locales: " . implode(', ', $locales));
         }
     }
 
@@ -729,8 +735,6 @@ class ShopifyScraperCommand extends Command
             ],
             [
                 'text_value' => $brand->id, // Store the attribute option ID
-                'created_at' => now(),
-                'updated_at' => now(),
             ]
         );
 
@@ -883,8 +887,6 @@ class ShopifyScraperCommand extends Command
                                 'locale' => $this->defaultLocale,
                                 'channel' => $this->defaultChannel,
                                 'text_value' => $option->id,
-                                'created_at' => now(),
-                                'updated_at' => now(),
                             ]);
                         }
                         break;
