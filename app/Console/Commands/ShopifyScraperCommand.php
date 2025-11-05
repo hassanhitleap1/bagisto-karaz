@@ -256,7 +256,9 @@ class ShopifyScraperCommand extends Command
             $categories = [];
             if (!empty($productData['product_type'])) {
                 $category = $this->getOrCreateCategory($productData['product_type'], $productData['image'] ?? null);
-                $categories[] = $category;
+                if ($category) {
+                    $categories[] = $category;
+                }
             }
 
             // 3. Get or create attribute family
@@ -265,7 +267,7 @@ class ShopifyScraperCommand extends Command
             // 4. Process product attributes/options
             $superAttributes = [];
             $attributeData = [];
-            if (!empty($productData['options'])) {
+            if (!empty($productData['options']) && is_array($productData['options'])) {
                 $result = $this->processProductOptions($productData['options']);
                 $superAttributes = $result['super_attributes'];
                 $attributeData = $result['attribute_data'];
@@ -388,6 +390,8 @@ class ShopifyScraperCommand extends Command
             return $this->categoryCache[$categoryName];
         }
 
+        $category = null;
+
         // Try to find existing category by translation
         $categoryTranslation = DB::table('category_translations')
             ->where('name', $categoryName)
@@ -396,37 +400,49 @@ class ShopifyScraperCommand extends Command
 
         if ($categoryTranslation) {
             $category = $this->categoryRepository->find($categoryTranslation->category_id);
-        } else {
-            // Create new category using repository with multi-locale support
-            $slug = Str::slug($categoryName);
+        }
 
-            // Build category data with all locales
-            $categoryData = [
-                'position' => 1,
-                'status' => 1,
-                'display_mode' => 'products_and_description',
-            ];
+        if (!$category) {
+            try {
+                // Create new category using repository with multi-locale support
+                $slug = Str::slug($categoryName);
 
-            // Add translations for all available locales
-            foreach ($this->availableLocales as $locale) {
-                $categoryData[$locale] = [
-                    'name' => $categoryName,
-                    'slug' => $slug,
-                    'description' => "Category for {$categoryName} products",
-                    'meta_title' => $categoryName,
-                    'meta_description' => "Shop {$categoryName} products",
-                    'meta_keywords' => $categoryName,
+                // Build category data with all locales
+                $categoryData = [
+                    'position' => 1,
+                    'status' => 1,
+                    'display_mode' => 'products_and_description',
                 ];
-            }
 
-            $category = $this->categoryRepository->create($categoryData);
+                // Add translations for all available locales
+                foreach ($this->availableLocales as $locale) {
+                    $categoryData[$locale] = [
+                        'name' => $categoryName,
+                        'slug' => $slug,
+                        'description' => "Category for {$categoryName} products",
+                        'meta_title' => $categoryName,
+                        'meta_description' => "Shop {$categoryName} products",
+                        'meta_keywords' => $categoryName,
+                    ];
+                }
 
-            $this->info("  - Created category: {$categoryName} (locales: " . implode(', ', $this->availableLocales) . ")");
+                $category = $this->categoryRepository->create($categoryData);
 
-            // Download and assign category image if available
-            if ($imageData && !empty($imageData['src']) && !isset($this->categoryImageCache[$categoryName])) {
-                $this->downloadAndAssignCategoryImage($category->id, $imageData['src']);
-                $this->categoryImageCache[$categoryName] = true;
+                if (!$category || !$category->id) {
+                    $this->warn("  - Failed to create category: {$categoryName}");
+                    return null;
+                }
+
+                $this->info("  - Created category: {$categoryName} (ID: {$category->id}, locales: " . implode(', ', $this->availableLocales) . ")");
+
+                // Download and assign category image if available
+                if ($imageData && !empty($imageData['src']) && !isset($this->categoryImageCache[$categoryName])) {
+                    $this->downloadAndAssignCategoryImage($category->id, $imageData['src']);
+                    $this->categoryImageCache[$categoryName] = true;
+                }
+            } catch (\Exception $e) {
+                $this->error("  - Failed to create category {$categoryName}: {$e->getMessage()}");
+                return null;
             }
         }
 
@@ -885,7 +901,9 @@ class ShopifyScraperCommand extends Command
             if (empty($tagName)) continue;
 
             $category = $this->getOrCreateCategory($tagName);
-            $categories[] = $category;
+            if ($category) {
+                $categories[] = $category;
+            }
         }
 
         return $categories;
