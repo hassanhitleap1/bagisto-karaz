@@ -305,26 +305,49 @@ class ShopifyScraperCommand extends Command
             return $this->brandCache[$vendorName];
         }
 
-        // Check if brand exists in database
-        $brand = DB::table('brands')->where('name', $vendorName)->first();
+        // Get the brand attribute (code: 'brand')
+        $brandAttribute = DB::table('attributes')->where('code', 'brand')->first();
 
-        if (!$brand) {
-            $slug = Str::slug($vendorName);
+        if (!$brandAttribute) {
+            $this->warn("  - Brand attribute not found in database. Skipping brand assignment.");
+            return null;
+        }
 
-            $brandId = DB::table('brands')->insertGetId([
-                'name' => $vendorName,
-                'slug' => $slug,
-                'status' => 1,
+        // Check if brand option already exists
+        $brandOption = DB::table('attribute_option_translations')
+            ->where('label', $vendorName)
+            ->whereIn('attribute_option_id', function ($query) use ($brandAttribute) {
+                $query->select('id')
+                    ->from('attribute_options')
+                    ->where('attribute_id', $brandAttribute->id);
+            })
+            ->first();
+
+        if ($brandOption) {
+            $brand = DB::table('attribute_options')->find($brandOption->attribute_option_id);
+        } else {
+            // Create new brand option
+            $brandOptionId = DB::table('attribute_options')->insertGetId([
+                'admin_name' => $vendorName,
+                'sort_order' => 0,
+                'attribute_id' => $brandAttribute->id,
                 'created_at' => now(),
                 'updated_at' => now(),
             ]);
 
-            $brand = DB::table('brands')->find($brandId);
-            $this->info("  - Created brand: {$vendorName}");
+            // Create translation
+            DB::table('attribute_option_translations')->insert([
+                'locale' => $this->defaultLocale,
+                'label' => $vendorName,
+                'attribute_option_id' => $brandOptionId,
+            ]);
 
-            // Download and assign brand image if available
+            $brand = DB::table('attribute_options')->find($brandOptionId);
+            $this->info("  - Created brand option: {$vendorName}");
+
+            // Download and assign brand image if available (swatch image)
             if ($imageData && !empty($imageData['src']) && !isset($this->brandImageCache[$vendorName])) {
-                $this->downloadAndAssignBrandImage($brandId, $imageData['src']);
+                $this->downloadAndAssignBrandImage($brandOptionId, $imageData['src']);
                 $this->brandImageCache[$vendorName] = true;
             }
         }
@@ -379,7 +402,7 @@ class ShopifyScraperCommand extends Command
         return $category;
     }
 
-    protected function downloadAndAssignBrandImage(int $brandId, string $imageUrl): void
+    protected function downloadAndAssignBrandImage(int $brandOptionId, string $imageUrl): void
     {
         try {
             $imageContent = $this->downloadImage($imageUrl);
@@ -392,18 +415,18 @@ class ShopifyScraperCommand extends Command
             $image = $manager->make($imageContent);
             $webpImage = $image->encode('webp', 90);
 
-            // Save to storage
-            $filename = 'brand-' . $brandId . '-' . time() . '.webp';
-            $path = 'brand/' . $filename;
+            // Save to storage as swatch image
+            $filename = 'attribute-option-' . $brandOptionId . '-' . time() . '.webp';
+            $path = 'attribute_option/' . $filename;
             Storage::put($path, $webpImage);
 
-            // Update brand with logo path
-            DB::table('brands')->where('id', $brandId)->update([
-                'logo' => $path,
+            // Update attribute option with swatch image path
+            DB::table('attribute_options')->where('id', $brandOptionId)->update([
+                'swatch_value' => $path,
                 'updated_at' => now(),
             ]);
 
-            $this->info("    - Downloaded and assigned brand image");
+            $this->info("    - Downloaded and assigned brand swatch image");
         } catch (Exception $e) {
             $this->warn("    - Failed to download brand image: {$e->getMessage()}");
         }
@@ -652,19 +675,33 @@ class ShopifyScraperCommand extends Command
 
     protected function assignBrandToProduct($product, $brand): void
     {
-        DB::table('product_flat')
-            ->where('product_id', $product->id)
-            ->update(['brand' => $brand->name]);
-    }
-
-    protected function assignCategoriesToProduct($product, array $categories): void
-    {
-        foreach ($categories as $category) {
-            DB::table('product_categories')->insertOrIgnore([
-                'product_id' => $product->id,
-                'category_id' => $category->id,
-            ]);
+        if (!$brand) {
+            return;
         }
+
+        // Get brand attribute
+        $brandAttribute = DB::table('attributes')->where('code', 'brand')->first();
+
+        if (!$brandAttribute) {
+            return;
+        }
+
+        // Assign brand as product attribute value
+        DB::table('product_attribute_values')->updateOrInsert(
+            [
+                'product_id' => $product->id,
+                'attribute_id' => $brandAttribute->id,
+                'channel' => $this->defaultChannel,
+                'locale' => $this->defaultLocale,
+            ],
+            [
+                'text_value' => $brand->id, // Store the attribute option ID
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]
+        );
+
+        $this->info("  - Assigned brand: {$brand->admin_name}");
     }
 
     protected function processProductImages($product, array $images): void
