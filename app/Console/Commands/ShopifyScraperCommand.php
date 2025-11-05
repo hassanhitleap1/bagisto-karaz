@@ -757,16 +757,6 @@ class ShopifyScraperCommand extends Command
                         'position' => $index,
                     ]);
 
-                    // Set first image as main product image in product_flat
-                    if ($index === 0) {
-                        DB::table('product_flat')
-                            ->where('product_id', $product->id)
-                            ->update([
-                                'product_image' => $imagePath,
-                                'updated_at' => now(),
-                            ]);
-                    }
-
                     $imageCount++;
                 }
             } catch (Exception $e) {
@@ -841,13 +831,6 @@ class ShopifyScraperCommand extends Command
                                 'path' => $imagePath,
                                 'position' => 0,
                             ]);
-
-                            DB::table('product_flat')
-                                ->where('product_id', $variantProduct->id)
-                                ->update([
-                                    'product_image' => $imagePath,
-                                    'updated_at' => now(),
-                                ]);
                         }
                     }
                 }
