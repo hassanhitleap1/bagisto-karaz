@@ -755,8 +755,6 @@ class ShopifyScraperCommand extends Command
                         'type' => 'image',
                         'path' => $imagePath,
                         'position' => $index,
-                        'created_at' => now(),
-                        'updated_at' => now(),
                     ]);
 
                     // Set first image as main product image in product_flat
@@ -842,8 +840,6 @@ class ShopifyScraperCommand extends Command
                                 'type' => 'image',
                                 'path' => $imagePath,
                                 'position' => 0,
-                                'created_at' => now(),
-                                'updated_at' => now(),
                             ]);
 
                             DB::table('product_flat')
