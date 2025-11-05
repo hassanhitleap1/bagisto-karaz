@@ -8,27 +8,80 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
+use Intervention\Image\ImageManager;
+use Webkul\Attribute\Repositories\AttributeRepository;
+use Webkul\Attribute\Repositories\AttributeOptionRepository;
+use Webkul\Attribute\Repositories\AttributeFamilyRepository;
+use Webkul\Category\Repositories\CategoryRepository;
+use Webkul\Product\Repositories\ProductRepository;
+use Webkul\Product\Repositories\ProductImageRepository;
+use Webkul\Product\Repositories\ProductInventoryRepository;
+use Webkul\Product\Repositories\ProductAttributeValueRepository;
 
 class ShopifyScraperCommand extends Command
 {
-    protected $signature = 'import:shopify-products 
+    protected $signature = 'import:shopify-products
                            {--url= : Shopify store URL}
                            {--per-page=250 : Items per page}
                            {--max-pages= : Maximum pages to import}
                            {--current-page=1 : Current page to start from}';
 
-    protected $description = 'Scrape Shopify products and import to Bagisto';
+    protected $description = 'Scrape Shopify products and import to Bagisto with full attributes, variants, images, brands, and categories';
 
     protected string $baseUrl;
     protected int $perPage;
     protected int $currentPage;
     protected ?int $maxPages;
-    
+
     // Caches to improve performance
     protected array $attributeCache = [];
+    protected array $attributeOptionCache = [];
     protected array $brandCache = [];
     protected array $categoryCache = [];
+    protected array $categoryImageCache = [];
+    protected array $brandImageCache = [];
     protected array $attributeFamilyCache = [];
+    protected array $skuCache = [];
+
+    // Repositories
+    protected AttributeRepository $attributeRepository;
+    protected AttributeOptionRepository $attributeOptionRepository;
+    protected AttributeFamilyRepository $attributeFamilyRepository;
+    protected CategoryRepository $categoryRepository;
+    protected ProductRepository $productRepository;
+    protected ProductImageRepository $productImageRepository;
+    protected ProductInventoryRepository $productInventoryRepository;
+    protected ProductAttributeValueRepository $productAttributeValueRepository;
+
+    // Default values
+    protected string $defaultLocale = 'en';
+    protected string $defaultChannel = 'default';
+    protected int $defaultInventorySourceId = 1;
+
+    /**
+     * Constructor
+     */
+    public function __construct(
+        AttributeRepository $attributeRepository,
+        AttributeOptionRepository $attributeOptionRepository,
+        AttributeFamilyRepository $attributeFamilyRepository,
+        CategoryRepository $categoryRepository,
+        ProductRepository $productRepository,
+        ProductImageRepository $productImageRepository,
+        ProductInventoryRepository $productInventoryRepository,
+        ProductAttributeValueRepository $productAttributeValueRepository
+    ) {
+        parent::__construct();
+
+        $this->attributeRepository = $attributeRepository;
+        $this->attributeOptionRepository = $attributeOptionRepository;
+        $this->attributeFamilyRepository = $attributeFamilyRepository;
+        $this->categoryRepository = $categoryRepository;
+        $this->productRepository = $productRepository;
+        $this->productImageRepository = $productImageRepository;
+        $this->productInventoryRepository = $productInventoryRepository;
+        $this->productAttributeValueRepository = $productAttributeValueRepository;
+    }
 
     public function handle(): int
     {
@@ -48,11 +101,13 @@ class ShopifyScraperCommand extends Command
 
         $this->info("Starting Shopify import from: {$this->baseUrl}");
         $this->info("Configuration: {$this->perPage} products per page, starting at page {$this->currentPage}");
+        $this->info("Minimum pages to scrape: 3");
 
         $totalImported = 0;
+        $totalFailed = 0;
         $pagesProcessed = 0;
 
-        // Process pages
+        // Process pages (minimum 3 pages)
         while (true) {
             try {
                 // Check max pages limit
@@ -62,17 +117,30 @@ class ShopifyScraperCommand extends Command
                 }
 
                 $this->info("\n--- Processing Page {$this->currentPage} ---");
-                
+
                 $response = $this->fetchProductsPage($this->currentPage);
 
                 if ($response->failed()) {
                     $this->error("Failed to fetch page {$this->currentPage}: HTTP {$response->status()}");
+
+                    // If we haven't processed minimum 3 pages, continue trying
+                    if ($pagesProcessed < 3) {
+                        $this->warn("Retrying in 2 seconds...");
+                        sleep(2);
+                        continue;
+                    }
                     break;
                 }
 
                 $data = $response->json();
 
                 if (empty($data['products'])) {
+                    if ($pagesProcessed < 3) {
+                        $this->warn("No products found on page {$this->currentPage}, but continuing to meet minimum 3 pages requirement");
+                        $pagesProcessed++;
+                        $this->currentPage++;
+                        continue;
+                    }
                     $this->info("No more products found. Import completed.");
                     break;
                 }
@@ -83,22 +151,25 @@ class ShopifyScraperCommand extends Command
                 // Process each product
                 foreach ($data['products'] as $index => $productData) {
                     $this->info("\nProcessing product " . ($index + 1) . "/{$productsCount}: {$productData['title']}");
-                    
+
                     try {
                         $this->processProduct($productData);
                         $totalImported++;
                         $this->info("✓ Successfully imported: {$productData['title']}");
                     } catch (Exception $e) {
+                        $totalFailed++;
                         $this->error("✗ Failed to import {$productData['title']}: {$e->getMessage()}");
-                        $this->error($e->getTraceAsString());
+                        if ($this->option('verbose')) {
+                            $this->error($e->getTraceAsString());
+                        }
                     }
                 }
 
                 $pagesProcessed++;
                 $this->currentPage++;
 
-                // Break if we got fewer products than requested (last page)
-                if ($productsCount < $this->perPage) {
+                // Break if we got fewer products than requested (last page) and we've processed at least 3 pages
+                if ($productsCount < $this->perPage && $pagesProcessed >= 3) {
                     $this->info("Reached last page of products");
                     break;
                 }
@@ -108,13 +179,19 @@ class ShopifyScraperCommand extends Command
 
             } catch (Exception $e) {
                 $this->error("Error on page {$this->currentPage}: {$e->getMessage()}");
-                break;
+                if ($pagesProcessed >= 3) {
+                    break;
+                }
             }
         }
 
         $this->info("\n=== Import Summary ===");
         $this->info("Total products imported: {$totalImported}");
+        $this->info("Total products failed: {$totalFailed}");
         $this->info("Pages processed: {$pagesProcessed}");
+        $this->info("Brands created/updated: " . count($this->brandCache));
+        $this->info("Categories created/updated: " . count($this->categoryCache));
+        $this->info("Attributes created/updated: " . count($this->attributeCache));
 
         return 0;
     }
@@ -132,68 +209,108 @@ class ShopifyScraperCommand extends Command
     protected function processProduct(array $productData): void
     {
         DB::transaction(function () use ($productData) {
-            // 1. Get or create brand
-            $brand = null;
-            if (!empty($productData['vendor'])) {
-                $brand = $this->getOrCreateBrand($productData['vendor']);
+            // Check for duplicate SKU
+            $firstVariant = $productData['variants'][0] ?? [];
+            $sku = $this->generateSku($firstVariant, $productData['title']);
+
+            if (isset($this->skuCache[$sku]) || $this->productRepository->findOneByField('sku', $sku)) {
+                $this->warn("Product with SKU {$sku} already exists. Skipping...");
+                return;
             }
 
-            // 2. Get or create category
-            $category = null;
+            $this->skuCache[$sku] = true;
+
+            // 1. Get or create brand with image
+            $brand = null;
+            if (!empty($productData['vendor'])) {
+                $brand = $this->getOrCreateBrand($productData['vendor'], $productData['image'] ?? null);
+            }
+
+            // 2. Get or create categories with images
+            $categories = [];
             if (!empty($productData['product_type'])) {
-                $category = $this->getOrCreateCategory($productData['product_type']);
+                $category = $this->getOrCreateCategory($productData['product_type'], $productData['image'] ?? null);
+                $categories[] = $category;
             }
 
             // 3. Get or create attribute family
             $attributeFamily = $this->getOrCreateAttributeFamily();
 
             // 4. Process product attributes/options
-            $attributes = [];
+            $superAttributes = [];
+            $attributeData = [];
             if (!empty($productData['options'])) {
-                $attributes = $this->processProductOptions($productData['options']);
+                $result = $this->processProductOptions($productData['options']);
+                $superAttributes = $result['super_attributes'];
+                $attributeData = $result['attribute_data'];
             }
 
-            // 5. Create main product
-            $product = $this->createProduct($productData, $attributeFamily->id);
+            // 5. Determine product type
+            $hasVariants = !empty($productData['variants']) && count($productData['variants']) > 1;
+            $productType = $hasVariants ? 'configurable' : 'simple';
 
-            // 6. Assign brand
+            // 6. Create main product using repository
+            $product = $this->createProduct($productData, $attributeFamily, $productType, $superAttributes);
+
+            // 7. Assign brand
             if ($brand) {
                 $this->assignBrandToProduct($product, $brand);
             }
 
-            // 7. Assign categories
-            if ($category) {
-                $this->assignCategoriesToProduct($product, [$category]);
+            // 8. Assign categories
+            if (!empty($categories)) {
+                $product->categories()->sync(collect($categories)->pluck('id')->toArray());
+                $this->info("  - Assigned " . count($categories) . " categories");
             }
 
-            // 8. Process and assign main product images
+            // 9. Process and assign main product images
             if (!empty($productData['images'])) {
                 $this->processProductImages($product, $productData['images']);
             }
 
-            // 9. Process variants
-            if (!empty($productData['variants']) && count($productData['variants']) > 1) {
-                $this->processVariants($product, $productData['variants'], $productData['images'] ?? [], $attributes);
+            // 10. Process variants
+            if ($hasVariants) {
+                $this->processVariants($product, $productData['variants'], $productData['images'] ?? [], $attributeData);
+            } else {
+                // For simple products, update with first variant data
+                $this->updateSimpleProductData($product, $firstVariant);
             }
 
-            // 10. Assign tags as additional categories if present
+            // 11. Assign tags as additional categories if present
             if (!empty($productData['tags'])) {
-                $this->processTags($product, $productData['tags']);
+                $tagCategories = $this->processTags($productData['tags']);
+                if (!empty($tagCategories)) {
+                    $allCategoryIds = array_merge(
+                        collect($categories)->pluck('id')->toArray(),
+                        collect($tagCategories)->pluck('id')->toArray()
+                    );
+                    $product->categories()->sync(array_unique($allCategoryIds));
+                }
             }
         });
     }
 
-    protected function getOrCreateBrand(string $vendorName)
+    protected function generateSku(array $variant, string $productTitle): string
+    {
+        if (!empty($variant['sku'])) {
+            return $variant['sku'];
+        }
+
+        return 'SHOP-' . Str::slug(substr($productTitle, 0, 20)) . '-' . Str::random(6);
+    }
+
+    protected function getOrCreateBrand(string $vendorName, ?array $imageData = null)
     {
         if (isset($this->brandCache[$vendorName])) {
             return $this->brandCache[$vendorName];
         }
 
+        // Check if brand exists in database
         $brand = DB::table('brands')->where('name', $vendorName)->first();
 
         if (!$brand) {
             $slug = Str::slug($vendorName);
-            
+
             $brandId = DB::table('brands')->insertGetId([
                 'name' => $vendorName,
                 'slug' => $slug,
@@ -203,48 +320,139 @@ class ShopifyScraperCommand extends Command
             ]);
 
             $brand = DB::table('brands')->find($brandId);
-            $this->info("Created brand: {$vendorName}");
+            $this->info("  - Created brand: {$vendorName}");
+
+            // Download and assign brand image if available
+            if ($imageData && !empty($imageData['src']) && !isset($this->brandImageCache[$vendorName])) {
+                $this->downloadAndAssignBrandImage($brandId, $imageData['src']);
+                $this->brandImageCache[$vendorName] = true;
+            }
         }
 
         $this->brandCache[$vendorName] = $brand;
         return $brand;
     }
 
-    protected function getOrCreateCategory(string $categoryName)
+    protected function getOrCreateCategory(string $categoryName, ?array $imageData = null)
     {
         if (isset($this->categoryCache[$categoryName])) {
             return $this->categoryCache[$categoryName];
         }
 
-        $category = DB::table('categories')->where('name', $categoryName)->first();
+        // Try to find existing category by translation
+        $categoryTranslation = DB::table('category_translations')
+            ->where('name', $categoryName)
+            ->where('locale', $this->defaultLocale)
+            ->first();
 
-        if (!$category) {
+        if ($categoryTranslation) {
+            $category = $this->categoryRepository->find($categoryTranslation->category_id);
+        } else {
+            // Create new category using repository
             $slug = Str::slug($categoryName);
-            
-            $categoryId = DB::table('categories')->insertGetId([
-                'name' => $categoryName,
-                'slug' => $slug,
+
+            $category = $this->categoryRepository->create([
+                'position' => 1,
                 'status' => 1,
-                'display_mode' => 'products_only',
-                'created_at' => now(),
-                'updated_at' => now(),
+                'display_mode' => 'products_and_description',
+                $this->defaultLocale => [
+                    'name' => $categoryName,
+                    'slug' => $slug,
+                    'description' => "Category for {$categoryName} products",
+                    'meta_title' => $categoryName,
+                    'meta_description' => "Shop {$categoryName} products",
+                    'meta_keywords' => $categoryName,
+                    'locale_id' => 1,
+                ],
             ]);
 
-            // Create category translation
-            DB::table('category_translations')->insert([
-                'locale' => 'en',
-                'name' => $categoryName,
-                'slug' => $slug,
-                'description' => $categoryName,
-                'category_id' => $categoryId,
-            ]);
+            $this->info("  - Created category: {$categoryName}");
 
-            $category = DB::table('categories')->find($categoryId);
-            $this->info("Created category: {$categoryName}");
+            // Download and assign category image if available
+            if ($imageData && !empty($imageData['src']) && !isset($this->categoryImageCache[$categoryName])) {
+                $this->downloadAndAssignCategoryImage($category->id, $imageData['src']);
+                $this->categoryImageCache[$categoryName] = true;
+            }
         }
 
         $this->categoryCache[$categoryName] = $category;
         return $category;
+    }
+
+    protected function downloadAndAssignBrandImage(int $brandId, string $imageUrl): void
+    {
+        try {
+            $imageContent = $this->downloadImage($imageUrl);
+            if (!$imageContent) {
+                return;
+            }
+
+            // Convert to WebP
+            $manager = new ImageManager(['driver' => 'gd']);
+            $image = $manager->make($imageContent);
+            $webpImage = $image->encode('webp', 90);
+
+            // Save to storage
+            $filename = 'brand-' . $brandId . '-' . time() . '.webp';
+            $path = 'brand/' . $filename;
+            Storage::put($path, $webpImage);
+
+            // Update brand with logo path
+            DB::table('brands')->where('id', $brandId)->update([
+                'logo' => $path,
+                'updated_at' => now(),
+            ]);
+
+            $this->info("    - Downloaded and assigned brand image");
+        } catch (Exception $e) {
+            $this->warn("    - Failed to download brand image: {$e->getMessage()}");
+        }
+    }
+
+    protected function downloadAndAssignCategoryImage(int $categoryId, string $imageUrl): void
+    {
+        try {
+            $imageContent = $this->downloadImage($imageUrl);
+            if (!$imageContent) {
+                return;
+            }
+
+            // Convert to WebP
+            $manager = new ImageManager(['driver' => 'gd']);
+            $image = $manager->make($imageContent);
+            $webpImage = $image->encode('webp', 90);
+
+            // Save to storage
+            $filename = 'category-' . $categoryId . '-' . time() . '.webp';
+            $path = 'category/' . $filename;
+            Storage::put($path, $webpImage);
+
+            // Update category with logo path
+            DB::table('categories')->where('id', $categoryId)->update([
+                'logo_path' => $path,
+                'updated_at' => now(),
+            ]);
+
+            $this->info("    - Downloaded and assigned category image");
+        } catch (Exception $e) {
+            $this->warn("    - Failed to download category image: {$e->getMessage()}");
+        }
+    }
+
+    protected function downloadImage(string $url): ?string
+    {
+        try {
+            $response = Http::timeout(30)->get($url);
+
+            if ($response->successful()) {
+                return $response->body();
+            }
+
+            return null;
+        } catch (Exception $e) {
+            $this->warn("    - Failed to download image from {$url}: {$e->getMessage()}");
+            return null;
+        }
     }
 
     protected function getOrCreateAttributeFamily()
@@ -276,7 +484,8 @@ class ShopifyScraperCommand extends Command
 
     protected function processProductOptions(array $options): array
     {
-        $processedAttributes = [];
+        $superAttributes = [];
+        $attributeData = [];
 
         foreach ($options as $option) {
             $attributeName = $option['name'];
@@ -284,14 +493,38 @@ class ShopifyScraperCommand extends Command
 
             // Get or create attribute
             $attribute = $this->getOrCreateAttribute($attributeCode, $attributeName, $option['values']);
-            
-            $processedAttributes[$option['position']] = [
+
+            $superAttributes[] = $attribute->id;
+
+            $attributeData[$attributeCode] = [
                 'attribute' => $attribute,
                 'values' => $option['values'],
+                'options' => $this->getAttributeOptions($attribute->id),
             ];
         }
 
-        return $processedAttributes;
+        return [
+            'super_attributes' => $superAttributes,
+            'attribute_data' => $attributeData,
+        ];
+    }
+
+    protected function getAttributeOptions(int $attributeId): array
+    {
+        $cacheKey = 'attr_options_' . $attributeId;
+
+        if (isset($this->attributeOptionCache[$cacheKey])) {
+            return $this->attributeOptionCache[$cacheKey];
+        }
+
+        $options = DB::table('attribute_options')
+            ->where('attribute_id', $attributeId)
+            ->get()
+            ->keyBy('admin_name')
+            ->toArray();
+
+        $this->attributeOptionCache[$cacheKey] = $options;
+        return $options;
     }
 
     protected function getOrCreateAttribute(string $code, string $name, array $values)
@@ -353,49 +586,68 @@ class ShopifyScraperCommand extends Command
         return $attribute;
     }
 
-    protected function createProduct(array $productData, int $attributeFamilyId)
+    protected function createProduct(array $productData, $attributeFamily, string $productType, array $superAttributes = [])
     {
         $firstVariant = $productData['variants'][0] ?? [];
-        $sku = $firstVariant['sku'] ?? 'SKU-' . Str::random(10);
+        $sku = $this->generateSku($firstVariant, $productData['title']);
 
-        $productId = DB::table('products')->insertGetId([
-            'type' => count($productData['variants'] ?? []) > 1 ? 'configurable' : 'simple',
-            'attribute_family_id' => $attributeFamilyId,
+        // Prepare product data for repository
+        $data = [
+            'type' => $productType,
+            'attribute_family_id' => $attributeFamily->id,
             'sku' => $sku,
-            'parent_id' => null,
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
-
-        // Create product flat entry
-        DB::table('product_flat')->insert([
-            'product_id' => $productId,
-            'sku' => $sku,
-            'type' => count($productData['variants'] ?? []) > 1 ? 'configurable' : 'simple',
-            'name' => $productData['title'],
-            'short_description' => $this->stripHtml($productData['body_html'] ?? ''),
-            'description' => $productData['body_html'] ?? '',
-            'url_key' => Str::slug($productData['title']),
+            $this->defaultLocale => [
+                'name' => $productData['title'],
+                'url_key' => Str::slug($productData['title']) . '-' . Str::random(4),
+                'short_description' => $this->stripHtml($productData['body_html'] ?? ''),
+                'description' => $productData['body_html'] ?? '',
+                'meta_title' => $productData['title'],
+                'meta_keywords' => $productData['tags'] ?? '',
+                'meta_description' => substr($this->stripHtml($productData['body_html'] ?? ''), 0, 160),
+            ],
             'status' => 1,
             'visible_individually' => 1,
+            'guest_checkout' => 1,
+            'new' => 1,
+            'featured' => 0,
             'price' => (float) ($firstVariant['price'] ?? 0),
-            'special_price' => isset($firstVariant['compare_at_price']) ? (float) $firstVariant['price'] : null,
+            'cost' => null,
+            'special_price' => isset($firstVariant['compare_at_price']) && $firstVariant['compare_at_price'] > $firstVariant['price']
+                ? (float) $firstVariant['price']
+                : null,
+            'special_price_from' => null,
+            'special_price_to' => null,
             'weight' => (float) ($firstVariant['weight'] ?? 0),
-            'locale' => 'en',
-            'channel' => 'default',
-            'created_at' => now(),
-            'updated_at' => now(),
-        ]);
+            'channel' => $this->defaultChannel,
+            'locale' => $this->defaultLocale,
+            'inventories' => [
+                $this->defaultInventorySourceId => (int) ($firstVariant['inventory_quantity'] ?? 0),
+            ],
+        ];
 
-        // Create product inventory
-        DB::table('product_inventories')->insert([
-            'product_id' => $productId,
-            'inventory_source_id' => 1,
-            'vendor_id' => 0,
-            'qty' => (int) ($firstVariant['inventory_quantity'] ?? 0),
-        ]);
+        // Add super attributes for configurable products
+        if ($productType === 'configurable' && !empty($superAttributes)) {
+            $data['super_attributes'] = $superAttributes;
+        }
 
-        return (object) ['id' => $productId, 'sku' => $sku];
+        // Create product using repository
+        $product = $this->productRepository->create($data);
+
+        $this->info("  - Created {$productType} product: {$productData['title']} (SKU: {$sku})");
+
+        return $product;
+    }
+
+    protected function updateSimpleProductData($product, array $variant): void
+    {
+        // Update inventory if needed
+        if (isset($variant['inventory_quantity'])) {
+            DB::table('product_inventories')
+                ->where('product_id', $product->id)
+                ->update([
+                    'qty' => (int) $variant['inventory_quantity'],
+                ]);
+        }
     }
 
     protected function assignBrandToProduct($product, $brand): void
@@ -417,159 +669,198 @@ class ShopifyScraperCommand extends Command
 
     protected function processProductImages($product, array $images): void
     {
+        $imageCount = 0;
+
         foreach ($images as $index => $image) {
             try {
-                $imagePath = $this->downloadImage($image['src'], $product->id);
-                
+                $imagePath = $this->downloadProductImage($image['src'], $product->id);
+
                 if ($imagePath) {
                     DB::table('product_images')->insert([
                         'product_id' => $product->id,
+                        'type' => 'image',
                         'path' => $imagePath,
                         'position' => $index,
                         'created_at' => now(),
                         'updated_at' => now(),
                     ]);
 
-                    // Set first image as main product image
+                    // Set first image as main product image in product_flat
                     if ($index === 0) {
                         DB::table('product_flat')
                             ->where('product_id', $product->id)
-                            ->update(['base_image' => $imagePath]);
+                            ->update([
+                                'product_image' => $imagePath,
+                                'updated_at' => now(),
+                            ]);
                     }
+
+                    $imageCount++;
                 }
             } catch (Exception $e) {
-                $this->warn("Failed to download image: {$e->getMessage()}");
+                $this->warn("    - Failed to download image: {$e->getMessage()}");
             }
+        }
+
+        if ($imageCount > 0) {
+            $this->info("  - Downloaded {$imageCount} product images");
         }
     }
 
-    protected function processVariants($product, array $variants, array $images, array $attributes): void
+    protected function processVariants($product, array $variants, array $images, array $attributeData): void
     {
-        // Create super attributes
-        foreach ($attributes as $attrData) {
-            DB::table('product_super_attributes')->insertOrIgnore([
-                'product_id' => $product->id,
-                'attribute_id' => $attrData['attribute']->id,
-            ]);
-        }
+        $this->info("  - Processing " . count($variants) . " variants");
+        $variantCount = 0;
 
         foreach ($variants as $index => $variant) {
-            $variantSku = $variant['sku'] ?? $product->sku . '-V' . ($index + 1);
+            try {
+                $variantSku = !empty($variant['sku']) ? $variant['sku'] : $product->sku . '-V' . ($index + 1);
 
-            // Create variant product
-            $variantProductId = DB::table('products')->insertGetId([
-                'type' => 'simple',
-                'attribute_family_id' => DB::table('products')->where('id', $product->id)->value('attribute_family_id'),
-                'sku' => $variantSku,
-                'parent_id' => $product->id,
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
+                // Check if variant already exists
+                if (isset($this->skuCache[$variantSku]) || $this->productRepository->findOneByField('sku', $variantSku)) {
+                    $this->warn("    - Variant SKU {$variantSku} already exists. Skipping...");
+                    continue;
+                }
 
-            // Create variant flat
-            DB::table('product_flat')->insert([
-                'product_id' => $variantProductId,
-                'sku' => $variantSku,
-                'type' => 'simple',
-                'name' => $variant['title'],
-                'url_key' => Str::slug($variant['title']),
-                'status' => 1,
-                'visible_individually' => 0,
-                'price' => (float) ($variant['price'] ?? 0),
-                'special_price' => isset($variant['compare_at_price']) ? (float) $variant['price'] : null,
-                'weight' => (float) ($variant['weight'] ?? 0),
-                'locale' => 'en',
-                'channel' => 'default',
-                'parent_id' => $product->id,
-                'created_at' => now(),
-                'updated_at' => now(),
-            ]);
+                $this->skuCache[$variantSku] = true;
 
-            // Create variant inventory
-            DB::table('product_inventories')->insert([
-                'product_id' => $variantProductId,
-                'inventory_source_id' => 1,
-                'vendor_id' => 0,
-                'qty' => (int) ($variant['inventory_quantity'] ?? 0),
-            ]);
+                // Prepare variant data
+                $variantData = [
+                    'type' => 'simple',
+                    'attribute_family_id' => $product->attribute_family_id,
+                    'sku' => $variantSku,
+                    'parent_id' => $product->id,
+                    $this->defaultLocale => [
+                        'name' => $variant['title'] ?? $product->name . ' - Variant ' . ($index + 1),
+                        'url_key' => Str::slug($variant['title'] ?? $product->name) . '-' . Str::random(4),
+                        'short_description' => $product->short_description ?? '',
+                        'description' => $product->description ?? '',
+                    ],
+                    'status' => 1,
+                    'visible_individually' => 0,
+                    'price' => (float) ($variant['price'] ?? 0),
+                    'cost' => null,
+                    'special_price' => isset($variant['compare_at_price']) && $variant['compare_at_price'] > $variant['price']
+                        ? (float) $variant['price']
+                        : null,
+                    'weight' => (float) ($variant['weight'] ?? 0),
+                    'channel' => $this->defaultChannel,
+                    'locale' => $this->defaultLocale,
+                    'inventories' => [
+                        $this->defaultInventorySourceId => (int) ($variant['inventory_quantity'] ?? 0),
+                    ],
+                ];
 
-            // Assign variant image
-            if (!empty($variant['image_id'])) {
-                $variantImage = collect($images)->firstWhere('id', $variant['image_id']);
-                if ($variantImage) {
-                    $imagePath = $this->downloadImage($variantImage['src'], $variantProductId);
-                    if ($imagePath) {
-                        DB::table('product_flat')
-                            ->where('product_id', $variantProductId)
-                            ->update(['base_image' => $imagePath]);
+                // Create variant product
+                $variantProduct = $this->productRepository->create($variantData);
+
+                // Assign variant attribute values
+                $this->assignVariantAttributes($variantProduct, $variant, $attributeData);
+
+                // Assign variant image if available
+                if (!empty($variant['image_id'])) {
+                    $variantImage = collect($images)->firstWhere('id', $variant['image_id']);
+                    if ($variantImage && !empty($variantImage['src'])) {
+                        $imagePath = $this->downloadProductImage($variantImage['src'], $variantProduct->id);
+                        if ($imagePath) {
+                            DB::table('product_images')->insert([
+                                'product_id' => $variantProduct->id,
+                                'type' => 'image',
+                                'path' => $imagePath,
+                                'position' => 0,
+                                'created_at' => now(),
+                                'updated_at' => now(),
+                            ]);
+
+                            DB::table('product_flat')
+                                ->where('product_id', $variantProduct->id)
+                                ->update([
+                                    'product_image' => $imagePath,
+                                    'updated_at' => now(),
+                                ]);
+                        }
+                    }
+                }
+
+                $variantCount++;
+            } catch (Exception $e) {
+                $this->error("    - Failed to create variant: {$e->getMessage()}");
+            }
+        }
+
+        $this->info("  - Created {$variantCount} variants successfully");
+    }
+
+    protected function assignVariantAttributes($variantProduct, array $variant, array $attributeData): void
+    {
+        // Assign variant option values (option1, option2, option3)
+        for ($i = 1; $i <= 3; $i++) {
+            $optionKey = "option{$i}";
+            if (!empty($variant[$optionKey])) {
+                $optionValue = $variant[$optionKey];
+
+                // Find the corresponding attribute
+                foreach ($attributeData as $attrCode => $attrInfo) {
+                    if (isset($attrInfo['values']) && in_array($optionValue, $attrInfo['values'])) {
+                        // Find the option ID
+                        $option = collect($attrInfo['options'])->firstWhere('admin_name', $optionValue);
+
+                        if ($option) {
+                            // Save attribute value
+                            DB::table('product_attribute_values')->insert([
+                                'product_id' => $variantProduct->id,
+                                'attribute_id' => $attrInfo['attribute']->id,
+                                'locale' => $this->defaultLocale,
+                                'channel' => $this->defaultChannel,
+                                'text_value' => $option->id,
+                                'created_at' => now(),
+                                'updated_at' => now(),
+                            ]);
+                        }
+                        break;
                     }
                 }
             }
-
-            // Link variant attributes
-            for ($i = 1; $i <= 3; $i++) {
-                $optionKey = "option{$i}";
-                if (!empty($variant[$optionKey])) {
-                    $this->linkVariantAttribute($variantProductId, $variant[$optionKey]);
-                }
-            }
         }
     }
 
-    protected function linkVariantAttribute(int $variantProductId, string $optionValue): void
-    {
-        // Find the attribute option
-        $option = DB::table('attribute_option_translations')
-            ->where('label', $optionValue)
-            ->first();
-
-        if ($option) {
-            $attributeOption = DB::table('attribute_options')->find($option->attribute_option_id);
-            
-            if ($attributeOption) {
-                DB::table('product_attribute_values')->insertOrIgnore([
-                    'product_id' => $variantProductId,
-                    'attribute_id' => $attributeOption->attribute_id,
-                    'value' => $option->attribute_option_id,
-                    'channel' => 'default',
-                    'locale' => 'en',
-                ]);
-            }
-        }
-    }
-
-    protected function processTags($product, $tags): void
+    protected function processTags($tags): array
     {
         $tagArray = is_array($tags) ? $tags : array_map('trim', explode(',', $tags));
+        $categories = [];
 
         foreach ($tagArray as $tagName) {
             $tagName = trim($tagName);
             if (empty($tagName)) continue;
 
             $category = $this->getOrCreateCategory($tagName);
-            $this->assignCategoriesToProduct($product, [$category]);
+            $categories[] = $category;
         }
+
+        return $categories;
     }
 
-    protected function downloadImage(string $url, int $productId): ?string
+    protected function downloadProductImage(string $url, int $productId): ?string
     {
         try {
-            $response = Http::timeout(20)->retry(2, 1000)->get($url);
-
-            if (!$response->successful()) {
+            $imageContent = $this->downloadImage($url);
+            if (!$imageContent) {
                 return null;
             }
 
-            $imageData = $response->body();
-            $extension = pathinfo(parse_url($url, PHP_URL_PATH), PATHINFO_EXTENSION) ?: 'jpg';
-            $fileName = 'product-' . $productId . '-' . Str::random(10) . '.' . $extension;
-            $path = "product/{$productId}/{$fileName}";
+            // Convert to WebP
+            $manager = new ImageManager(['driver' => 'gd']);
+            $image = $manager->make($imageContent);
+            $webpImage = $image->encode('webp', 90);
 
-            Storage::disk('public')->put($path, $imageData);
+            // Save to storage
+            $fileName = 'product-' . $productId . '-' . Str::random(10) . '.webp';
+            $path = "product/{$productId}/{$fileName}";
+            Storage::put($path, $webpImage);
 
             return $path;
         } catch (Exception $e) {
-            $this->warn("Image download failed: {$e->getMessage()}");
+            $this->warn("    - Product image download failed: {$e->getMessage()}");
             return null;
         }
     }
